@@ -1,0 +1,13 @@
+{
+  "valid": false,
+  "errors": [
+    "case_05:account_service/account_005 expected PRESENT, observed ABSENT",
+    "case_11:search_service/search_052 expected ABSENT, observed PRESENT",
+    "case_11:support_platform/support_864 expected REDACTED, observed PRESENT",
+    "case_11:analytics_platform/analytics_2034 expected REDACTED, observed PRESENT",
+    "case_11:integration_service/data_flow_9522 expected ABSENT, observed PRESENT",
+    "case_13:search_service/search_1308 expected ABSENT, observed PRESENT",
+    "case_13:support_platform/support_4218 expected ABSENT, observed PRESENT",
+    "case_14:backup_service/backup_3870 expected ABSENT, observed PRESENT"
+  ]
+}

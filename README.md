@@ -74,6 +74,42 @@ Produce exactly one row per request. `deletion_status` is `COMPLETE`, `INCOMPLET
 
 The final file must contain 518 data rows sorted by `case_id` (plus the header row). The grader parses `steps_json` as JSON, so object-key order and whitespace do not matter; array order does. Order findings, remediation, and verification in that phase order. Within a phase, follow the operation order in the problem statement, then sort by `system_id` and `resource_id`.
 
+During execution, `code/main.py` also performs Phase 2 identity resolution. It starts
+from each qualifying request email, traverses current identity attributes and all
+historical `user_audit_log.csv` values to a fixpoint, and writes the resolved
+clusters to root-level `identity_resolution.json`. Each entry contains the seed
+email, connected `user_ids`, and grouped current/historical identifiers. The
+sample validation checks that sample resource references are well formed, seed
+identifiers are retained, and every audit value for discovered users is present
+in its cluster.
+
+Phase 3 loads SQL snapshots into isolated in-memory SQLite databases (falling
+back to the dump parser for fragment-only snapshots), extracts JSON/text/log
+records, loads `system_activity.csv`, and replays successful events through
+`audit_at`. The canonical state model is `PRESENT`, `ABSENT`, or `REDACTED`;
+replicas remain distinct because the key is `(target_system, resource_id)`.
+The resulting states are written to `state_reconstruction.json`, and the
+sample golden-step comparison is written to `state_validation.json`.
+
+Phase 4 scans successful system activity in the 30 days before each
+`audit_at`. Repeated `SYNC`, `EXPORT`, and `INDEX` activity (at least twice),
+scheduled activity, and unblocked restore-access checks become
+`REPORT_ACTIVE_DATA_FLOW` or `REPORT_RESTORE_RISK` findings with their
+`activity_id` evidence. Phase 5 loads `deletion_rules.csv`, maps each evidence
+category to its configured action, and emits finding, remediation, and
+verification steps. Final steps are sorted by phase, operation order,
+`system_id`, and `resource_id`, then numbered consecutively.
+
+Before export, Phase 6 sends each generated `steps_json` to the configured
+LLM auditor (or uses deterministic validation when no API key/client is
+configured). The auditor prompt checks missing findings, invalid operations,
+and phase order. Any negative or unavailable audit result is repaired through
+the deterministic canonicalizer, which removes invalid steps, sorts by phase,
+operation order, system, and resource, and renumbers from one. The quality
+harness then verifies the exact output schema, 518-row count, allowed
+operations, valid JSON arrays, `NOT_APPLICABLE=[]`, and consecutive numbering.
+Audit responses are written to `llm_audit.json`.
+
 ---
 
 ## Evaluation
