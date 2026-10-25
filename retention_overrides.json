@@ -1,0 +1,16 @@
+[
+  {
+    "system_id": "backup_service",
+    "resource_id": "backup_706",
+    "record_type": "BACKUP_ARCHIVE",
+    "from_operation": "DELETE_RECORD",
+    "to_operation": "BLOCK_RESTORE"
+  },
+  {
+    "system_id": "backup_service",
+    "resource_id": "backup_5165",
+    "record_type": "BACKUP_ARCHIVE",
+    "from_operation": "DELETE_RECORD",
+    "to_operation": "BLOCK_RESTORE"
+  }
+]

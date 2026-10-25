@@ -1,4 +1,3 @@
-"""Generate deletion-audit decisions from the participant-facing evidence."""
 
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ IDENTITY_OUTPUT = ROOT / "identity_resolution.json"
 STATE_OUTPUT = ROOT / "state_reconstruction.json"
 STATE_VALIDATION_OUTPUT = ROOT / "state_validation.json"
 AUDIT_OUTPUT = ROOT / "llm_audit.json"
+RETENTION_OUTPUT = ROOT / "retention_overrides.json"
 
 DELETE_TYPES = {
     "USER_PROFILE",
@@ -143,13 +143,22 @@ def classify_with_llm(
     OPENAI_API_KEY is configured; otherwise the privacy-safe DELETE default is
     applied.
     """
+    category, _ = classify_with_llm_status(request_text, client)
+    return category
+
+
+def classify_with_llm_status(
+    request_text: str,
+    client: Callable[[str], str] | None = None,
+) -> tuple[str, bool]:
+    """Return the intent and whether privacy-safe fallback mode was used."""
     try:
         if client is not None:
             response = client(llm_prompt(request_text))
         else:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                return DELETE_INTENT
+                return DELETE_INTENT, True
             payload = json.dumps({
                 "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 "temperature": 0,
@@ -164,9 +173,9 @@ def classify_with_llm(
             with urllib.request.urlopen(request, timeout=30) as result:
                 response = json.loads(result.read().decode("utf-8"))["choices"][0]["message"]["content"]
         category = str(response).strip().upper().split()[0]
-        return category if category in INTENT_CATEGORIES else DELETE_INTENT
+        return (category if category in INTENT_CATEGORIES else DELETE_INTENT), False
     except (KeyError, IndexError, TypeError, ValueError, OSError, urllib.error.URLError):
-        return DELETE_INTENT
+        return DELETE_INTENT, True
 
 
 def classify_intent(
@@ -429,14 +438,15 @@ class ActivityEvent:
     resource_id: str
     result: str
     details: str = ""
+    user_id: str = ""
 
 
-def load_system_activity() -> list[ActivityEvent]:
+def load_system_activity() -> dict[str, list[ActivityEvent]]:
     """Load activity events, retaining target_system as the resource system."""
-    events: list[ActivityEvent] = []
+    events: dict[str, list[ActivityEvent]] = defaultdict(list)
     for row in read_csv("system_activity.csv"):
         try:
-            events.append(ActivityEvent(
+            event = ActivityEvent(
                 activity_id=row["activity_id"],
                 event_time=parse_time(row["event_time"]),
                 event_type=norm(row["event_type"]).upper(),
@@ -444,10 +454,14 @@ def load_system_activity() -> list[ActivityEvent]:
                 resource_id=row["resource_id"].strip(),
                 result=norm(row["reported_result"]).upper(),
                 details=row.get("details", ""),
-            ))
+                user_id=row.get("user_id", "").strip(),
+            )
+            events[f"{event.system_id}|{event.resource_id}"].append(event)
         except (KeyError, ValueError):
             continue
-    return sorted(events, key=lambda event: (event.event_time, event.activity_id))
+    for resource_events in events.values():
+        resource_events.sort(key=lambda event: (event.event_time, event.activity_id))
+    return dict(events)
 
 
 def load_deletion_rules() -> dict[str, str]:
@@ -478,33 +492,37 @@ def flow_and_restore_findings(
     cluster: IdentityCluster,
     audit_at: datetime,
     states: dict[tuple[str, str], dict[str, str | None]],
-    activity: list[ActivityEvent],
+    events_index: dict[str, list[ActivityEvent]],
     window_days: int = 30,
 ) -> list[dict[str, Any]]:
     """Detect recurring/scheduled flows and unblocked restore risks."""
     identifiers = cluster.all_values
     cutoff = audit_at - timedelta(days=window_days)
-    relevant = [
-        event for event in activity
-        if event.event_time <= audit_at
-        and (
-            any(norm(value) in event.details.casefold() for value in identifiers)
-            or (event.system_id, event.resource_id) in states
-        )
-        and event.result in {"SUCCESS", "SUCCEEDED"}
-    ]
     findings: list[dict[str, Any]] = []
-    flow_events: dict[tuple[str, str], list[ActivityEvent]] = defaultdict(list)
-    for event in relevant:
-        if event.event_time >= cutoff and any(
-            token in event.event_type for token in ("SYNC", "EXPORT", "INDEX")
-        ):
-            flow_events[(event.system_id, event.resource_id)].append(event)
-    for key, events in flow_events.items():
-        scheduled = any("SCHEDULED" in event.details.upper() for event in events)
-        if len(events) < 2 and not scheduled:
+    for key in states:
+        events = [
+            event for event in events_index.get(f"{key[0]}|{key[1]}", [])
+            if event.event_time <= audit_at
+            and event.result in {"SUCCESS", "SUCCEEDED"}
+        ]
+        flow_events = [
+            event for event in events
+            if event.event_time >= cutoff
+            and any(token in event.event_type for token in ("SYNC", "EXPORT", "INDEX"))
+            and (
+                event.user_id in cluster.user_ids
+                or (
+                    not event.user_id
+                    and any(norm(value) in event.details.casefold() for value in identifiers)
+                )
+            )
+        ]
+        if not flow_events:
             continue
-        evidence = events[-1].activity_id
+        scheduled = any("SCHEDULED" in event.details.upper() for event in flow_events)
+        if len(flow_events) < 2 and not scheduled:
+            continue
+        evidence = flow_events[-1].activity_id
         findings.append(step(
             "FINDING", key[0], key[1], "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", evidence
         ))
@@ -512,31 +530,28 @@ def flow_and_restore_findings(
         if "BACKUP" not in key[0].upper() and not key[1].lower().startswith("backup_"):
             continue
         events = [
-            event for event in relevant
-            if (event.system_id, event.resource_id) == key
+            event for event in events_index.get(f"{key[0]}|{key[1]}", [])
+            if event.event_time <= audit_at
+            and event.result in {"SUCCESS", "SUCCEEDED"}
         ]
-        has_restore_access = any(
-            "RESTORE" in event.event_type for event in events
-        )
-        has_close = any(
-            token in event.event_type
-            for event in events
-            for token in ("PURGE", "DELETE", "BLOCK_RESTORE")
-        )
-        if has_restore_access and not has_close:
-            evidence = next(
-                event.activity_id for event in reversed(events)
-                if "RESTORE" in event.event_type
-            )
+        restore_events = [event for event in events if "RESTORE" in event.event_type]
+        close_events = [
+            event for event in events
+            if any(token in event.event_type for token in ("PURGE", "DELETE", "BLOCK_RESTORE"))
+        ]
+        last_restore = restore_events[-1] if restore_events else None
+        last_close = close_events[-1] if close_events else None
+        if last_restore and (last_close is None or last_restore.event_time > last_close.event_time):
             findings.append(step(
-                "FINDING", key[0], key[1], "REPORT_RESTORE_RISK", "ACTIVE", evidence
+                "FINDING", key[0], key[1], "REPORT_RESTORE_RISK", "ACTIVE",
+                last_restore.activity_id,
             ))
     return findings
 
 
 def replay_activity_events(
     initial_state: str,
-    events: Iterable[ActivityEvent],
+    events: list[ActivityEvent],
     audit_at: datetime,
 ) -> tuple[str, str | None]:
     """Replay successful events in strict chronological order."""
@@ -565,7 +580,7 @@ def replay_activity_events(
         "REDACT": "REDACTED",
         "REDACT_RECORD": "REDACTED",
     }
-    for event in sorted(events, key=lambda item: (item.event_time, item.activity_id)):
+    for event in events:
         if event.event_time > audit_at or event.result not in {"SUCCESS", "SUCCEEDED"}:
             continue
         next_state = transitions.get(event.event_type)
@@ -579,7 +594,7 @@ def reconstruct_resource_states(
     cluster: IdentityCluster,
     audit_at: datetime,
     records: list[Record],
-    activity: list[ActivityEvent],
+    events_index: dict[str, list[ActivityEvent]],
 ) -> dict[tuple[str, str], dict[str, str | None]]:
     """Reconstruct each evidence resource using its latest eligible snapshot."""
     snapshots: dict[tuple[str, str], Record] = {}
@@ -595,10 +610,7 @@ def reconstruct_resource_states(
     for key, snapshot in snapshots.items():
         state, activity_id = replay_activity_events(
             snapshot.state or "PRESENT",
-            (
-                event for event in activity
-                if (event.system_id, event.resource_id) == key
-            ),
+            events_index.get(f"{key[0]}|{key[1]}", []),
             audit_at,
         )
         states[key] = {
@@ -866,6 +878,85 @@ def step(phase: str, system: str, resource: str, operation: str, state: str, evi
     }
 
 
+def apply_retention_overrides(
+    steps: list[dict[str, Any]],
+    records: list[Record],
+    rules: dict[str, str],
+    override_log: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply deterministic retention precedence over generated operations."""
+    record_types: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for record in records:
+        record_types[(record.system_id, record.resource_id)].add(record.record_type)
+    result: list[dict[str, Any]] = []
+    backup_keys: set[tuple[str, str]] = set()
+    for item in steps:
+        key = (item["system_id"], item["resource_id"])
+        types = record_types.get(key, set())
+        record_type = (
+            "LEGAL_HOLD_RECORD" if "LEGAL_HOLD_RECORD" in types else
+            "SECURITY_AUDIT_LOG" if "SECURITY_AUDIT_LOG" in types else
+            "BACKUP_ARCHIVE" if "BACKUP_ARCHIVE" in types else
+            next(iter(types), "")
+        )
+        operation = item["operation"]
+        replacement: str | None = None
+        if record_type in {"SECURITY_AUDIT_LOG", "LEGAL_HOLD_RECORD"}:
+            if operation in {"DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD"}:
+                replacement = "VERIFY_RECORD_PRESENT"
+            elif operation == "REPORT_REMAINING_RECORD":
+                replacement = None
+        elif record_type in RETAIN_TYPES and record_type != "BACKUP_ARCHIVE":
+            if operation in {"DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD"}:
+                replacement = "VERIFY_RECORD_PRESENT"
+        elif record_type == "BACKUP_ARCHIVE":
+            backup_keys.add(key)
+            if operation == "DELETE_RECORD":
+                continue
+            if operation == "REDACT_RECORD":
+                replacement = "VERIFY_RESTORE_BLOCKED"
+        if replacement:
+            updated = dict(item)
+            updated["phase"] = "VERIFICATION"
+            updated["operation"] = replacement
+            updated["state"] = "PRESENT" if replacement == "VERIFY_RECORD_PRESENT" else "BLOCKED"
+            if override_log is not None:
+                override_log.append({
+                    "system_id": key[0],
+                    "resource_id": key[1],
+                    "record_type": record_type,
+                    "from_operation": operation,
+                    "to_operation": replacement,
+                })
+            result.append(updated)
+        else:
+            result.append(item)
+
+    for key in backup_keys:
+        has_block = any(
+            item["system_id"] == key[0]
+            and item["resource_id"] == key[1]
+            and item["operation"] == "BLOCK_RESTORE"
+            for item in result
+        )
+        if not has_block:
+            result.append(step(
+                "REMEDIATION", key[0], key[1], "BLOCK_RESTORE", "BLOCKED", ""
+            ))
+            result.append(step(
+                "VERIFICATION", key[0], key[1], "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""
+            ))
+            if override_log is not None:
+                override_log.append({
+                    "system_id": key[0],
+                    "resource_id": key[1],
+                    "record_type": "BACKUP_ARCHIVE",
+                    "from_operation": "DELETE_RECORD",
+                    "to_operation": "BLOCK_RESTORE",
+                })
+    return result
+
+
 def audit(
     request: dict[str, str],
     records: list[Record],
@@ -873,8 +964,9 @@ def audit(
     audits: list[dict[str, str]],
     llm_client: Callable[[str], str] | None = None,
     resolver: IdentityGraphResolver | None = None,
-    activity: list[ActivityEvent] | None = None,
     rules: dict[str, str] | None = None,
+    events_index: dict[str, list[ActivityEvent]] | None = None,
+    retention_log: list[dict[str, str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     if classify_intent(request["request_text"], llm_client) != DELETE_INTENT:
         return "NOT_APPLICABLE", []
@@ -940,10 +1032,11 @@ def audit(
         }[verification]
         verifications.append(step("VERIFICATION", record.system_id, record.resource_id, verification, verification_state, record.evidence_id))
 
-    if activity is not None:
-        reconstructed = reconstruct_resource_states(cluster, at, records, activity)
+    if events_index is not None:
+        indexed_events = events_index or {}
+        reconstructed = reconstruct_resource_states(cluster, at, records, indexed_events)
         flow_findings = flow_and_restore_findings(
-            cluster, at, reconstructed, activity
+            cluster, at, reconstructed, indexed_events
         )
         for finding_item in flow_findings:
             findings.append(finding_item)
@@ -962,7 +1055,15 @@ def audit(
                 verification, state, finding_item["evidence_id"],
             ))
 
-    incomplete = bool(findings)
+    override_log = retention_log if retention_log is not None else []
+    all_steps = findings + remediations + verifications
+    all_steps = apply_retention_overrides(
+        all_steps, records, rules or load_deletion_rules(), override_log
+    )
+    findings = [item for item in all_steps if item["phase"] == "FINDING"]
+    remediations = [item for item in all_steps if item["phase"] == "REMEDIATION"]
+    verifications = [item for item in all_steps if item["phase"] == "VERIFICATION"]
+    incomplete = bool(findings or remediations)
     if incomplete:
         for item in remediations + verifications:
             item["evidence_id"] = ""
@@ -1042,6 +1143,113 @@ def llm_audit_steps(
             "ok": False,
             "issues": ["LLM audit unavailable; deterministic quality checks required"],
         }
+
+
+LLM_SUGGESTION_PROMPT = """Review steps_json for case {case_id} and return only a JSON list of missing verification issues.
+Schema: [{{"type":"MISSING_VERIFICATION","system_id":"...","resource_id":"...","missing_op":"VERIFY_RECORD_ABSENT"}}]
+Do not suggest new resources. Do not change existing operations. Only identify missing verification steps for existing findings.
+
+steps_json:
+{steps_json}"""
+
+
+def llm_audit_suggestions(
+    case_id: str,
+    steps: list[dict[str, Any]],
+    client: Callable[[str], str] | None = None,
+) -> list[dict[str, str]]:
+    """Return untrusted issue suggestions; Python validates every fix."""
+    suggestions, _ = llm_audit_suggestions_status(case_id, steps, client)
+    return suggestions
+
+
+def llm_audit_suggestions_status(
+    case_id: str,
+    steps: list[dict[str, Any]],
+    client: Callable[[str], str] | None = None,
+) -> tuple[list[dict[str, str]], bool]:
+    """Return suggestions and whether the auditor used fallback mode."""
+    prompt = LLM_SUGGESTION_PROMPT.format(
+        case_id=case_id,
+        steps_json=json.dumps(steps, separators=(",", ":")),
+    )
+    try:
+        if client is not None:
+            response: Any = client(prompt)
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                return [], True
+            payload = json.dumps({
+                "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"),
+                data=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as result:
+                response = json.loads(result.read().decode("utf-8"))["choices"][0]["message"]["content"]
+        if isinstance(response, str):
+            response = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip()))
+        if not isinstance(response, list):
+            return [], False
+        return [
+            item for item in response
+            if isinstance(item, dict)
+            and all(isinstance(item.get(key), str) for key in (
+                "type", "system_id", "resource_id", "missing_op"
+            ))
+        ], False
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, urllib.error.URLError):
+        return [], True
+
+
+def apply_allowed_fixes(
+    steps: list[dict[str, Any]],
+    suggestions: list[dict[str, str]],
+    debug_log: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply only missing-verification suggestions for existing resources."""
+    existing_resources = {
+        (item.get("system_id"), item.get("resource_id"))
+        for item in steps
+    }
+    existing_operations = {
+        (item.get("system_id"), item.get("resource_id"), item.get("operation"))
+        for item in steps
+    }
+    result = [dict(item) for item in steps]
+    safe_states = {
+        "VERIFY_RECORD_ABSENT": "ABSENT",
+        "VERIFY_RECORD_PRESENT": "PRESENT",
+        "VERIFY_RECORD_REDACTED": "REDACTED",
+        "VERIFY_RECORD_ANONYMIZED": "REDACTED",
+        "VERIFY_DATA_FLOW_DISABLED": "DISABLED",
+        "VERIFY_RESTORE_BLOCKED": "BLOCKED",
+    }
+    for suggestion in suggestions:
+        key = (suggestion.get("system_id"), suggestion.get("resource_id"))
+        operation = suggestion.get("missing_op", "")
+        valid = (
+            suggestion.get("type") == "MISSING_VERIFICATION"
+            and key in existing_resources
+            and operation in VERIFICATION_ORDER
+            and (key[0], key[1], operation) not in existing_operations
+        )
+        if not valid:
+            if debug_log is not None:
+                debug_log.append(f"ignored suggestion: {suggestion}")
+            continue
+        result.append(step(
+            "VERIFICATION", key[0], key[1], operation,
+            safe_states[operation], "",
+        ))
+        existing_operations.add((key[0], key[1], operation))
+    return result
 
 
 def canonicalize_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1134,9 +1342,17 @@ def finalize_rows(
             steps = json.loads(row["steps_json"])
         except json.JSONDecodeError:
             steps = []
-        audit_result = llm_audit_steps(row["case_id"], steps, llm_auditor)
-        audit_results[row["case_id"]] = audit_result
-        repaired = canonicalize_steps(steps)
+        debug_log: list[str] = []
+        suggestions, fallback_mode = llm_audit_suggestions_status(
+            row["case_id"], steps, llm_auditor
+        )
+        repaired = apply_allowed_fixes(steps, suggestions, debug_log)
+        audit_results[row["case_id"]] = {
+            "suggestions": suggestions,
+            "ignored": debug_log,
+            "fallback_mode": fallback_mode,
+        }
+        repaired = canonicalize_steps(repaired)
         output_row = dict(row)
         output_row["steps_json"] = json.dumps(repaired, separators=(",", ":"))
         finalized.append(output_row)
@@ -1154,7 +1370,7 @@ def main(
     users = read_csv("user_identities.csv")
     audits = read_csv("user_audit_log.csv")
     records = load_records()
-    activity = load_system_activity()
+    events_index = load_system_activity()
     rules = load_deletion_rules()
     resolver = IdentityGraphResolver(users, audits)
     clusters = resolver.resolve_requests(requests, llm_client)
@@ -1171,7 +1387,7 @@ def main(
             clusters[request["case_id"]],
             parse_time(request["audit_at"]),
             records,
-            activity,
+            events_index,
         )
         for request in requests
         if request["case_id"] in clusters
@@ -1191,9 +1407,11 @@ def main(
     )
     requests.sort(key=lambda row: int(row["case_id"].rsplit("_", 1)[1]))
     generated_rows: list[dict[str, str]] = []
+    retention_log: list[dict[str, str]] = []
     for request in requests:
         status, steps = audit(
-            request, records, users, audits, llm_client, resolver, activity, rules
+            request, records, users, audits, llm_client, resolver, rules, events_index,
+            retention_log,
         )
         generated_rows.append({
             "case_id": request["case_id"],
@@ -1209,6 +1427,10 @@ def main(
         writer.writerows(final_rows)
     AUDIT_OUTPUT.write_text(
         json.dumps(audit_results, indent=2),
+        encoding="utf-8",
+    )
+    RETENTION_OUTPUT.write_text(
+        json.dumps(retention_log, indent=2),
         encoding="utf-8",
     )
     valid, errors = validate_intent_output(OUTPUT, DATASET / "sample_output.csv")
@@ -1227,7 +1449,7 @@ def main(
             validation_clusters[request["case_id"]],
             parse_time(request["audit_at"]),
             records,
-            activity,
+            events_index,
         )
         for request in sample_requests
         if request["case_id"] in validation_clusters

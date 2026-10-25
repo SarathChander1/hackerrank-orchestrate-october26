@@ -110,6 +110,12 @@ harness then verifies the exact output schema, 518-row count, allowed
 operations, valid JSON arrays, `NOT_APPLICABLE=[]`, and consecutive numbering.
 Audit responses are written to `llm_audit.json`.
 
+Retention and legal-hold overrides are applied deterministically after step
+generation and before sorting/numbering. Destructive operations on retained
+security/legal records are replaced with `VERIFY_RECORD_PRESENT`; backups
+receive `BLOCK_RESTORE` and `VERIFY_RESTORE_BLOCKED`. Override decisions are
+recorded in `retention_overrides.json`.
+
 ---
 
 ## Evaluation
