@@ -1,0 +1,45 @@
+# Local Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Generated reports, audit artifacts, and execution outputs
+/output.csv
+/identity_resolution.json
+/state_reconstruction.json
+/state_validation.json
+/llm_audit.json
+/retention_overrides.json
+/dataset/output.csv
+/dataset/*_output.csv
+
+# Local logs, traces, archives, and IDE artifacts
+*.log
+log.txt
+*.zip
+.vscode/
+.idea/
+
+# Private evidence and customer-related source data
+/dataset/evidence/
+/dataset/deletion_requests.csv
+/dataset/evidence_files.csv
+/dataset/system_activity.csv
+/dataset/user_audit_log.csv
+/dataset/user_identities.csv
