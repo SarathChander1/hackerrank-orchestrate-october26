@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import re
-import sqlite3
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+
+logger = logging.getLogger(__name__)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,7 +161,8 @@ def classify_with_llm_status(
         else:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                return DELETE_INTENT, True
+                logger.warning("Fallback Mode: LLM classification credentials unavailable")
+                return NOT_APPLICABLE_INTENT, True
             payload = json.dumps({
                 "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 "temperature": 0,
@@ -173,9 +177,10 @@ def classify_with_llm_status(
             with urllib.request.urlopen(request, timeout=30) as result:
                 response = json.loads(result.read().decode("utf-8"))["choices"][0]["message"]["content"]
         category = str(response).strip().upper().split()[0]
-        return (category if category in INTENT_CATEGORIES else DELETE_INTENT), False
+        return (category if category in INTENT_CATEGORIES else NOT_APPLICABLE_INTENT), False
     except (KeyError, IndexError, TypeError, ValueError, OSError, urllib.error.URLError):
-        return DELETE_INTENT, True
+        logger.exception("Fallback Mode: LLM classification failed")
+        return NOT_APPLICABLE_INTENT, True
 
 
 def classify_intent(
@@ -316,11 +321,6 @@ class IdentityCluster:
         values.update(self.user_ids)
         for field_values in self.identifiers.values():
             values.update(norm(value) for value in field_values)
-            values.update(
-                re.sub(r"\D", "", value)
-                for value in field_values
-                if re.search(r"\d", value)
-            )
         return {value for value in values if value}
 
 
@@ -761,50 +761,9 @@ def load_sql_evidence(
     evidence_id: str,
     captured_at: datetime,
 ) -> list[Record]:
-    """Load a SQL snapshot in SQLite, with a safe text fallback for dump fragments."""
+    """Parse only the supported INSERT grammar; never execute evidence SQL."""
     text = path.read_text(encoding="utf-8", errors="ignore")
-    records: list[Record] = []
-    connection = sqlite3.connect(":memory:")
-    try:
-        connection.executescript(text)
-        for table_name, in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ):
-            columns = {
-                row[1] for row in connection.execute(
-                    f'PRAGMA table_info("{table_name.replace(chr(34), chr(34) * 2)}")'
-                )
-            }
-            subject_columns = [
-                column for column in ("email", "email_hash", "phone", "user_id", "name")
-                if column in columns
-            ]
-            if not subject_columns:
-                continue
-            for row in connection.execute(
-                f'SELECT * FROM "{table_name.replace(chr(34), chr(34) * 2)}"'
-            ):
-                values = [str(value) for value in row if value is not None]
-                if not values:
-                    continue
-                table = table_name.casefold()
-                record_type = (
-                    "SEARCH_INDEX_ENTRY" if "search" in table else
-                    "SUPPORT_MESSAGE" if "support" in table else
-                    "ANALYTICS_PROFILE" if "analytic" in table or "telemetry" in table else
-                    "SECURITY_AUDIT_LOG" if "audit" in table or "security" in table else
-                    "BACKUP_ARCHIVE" if "backup" in table or "archive" in table else
-                    "USER_PROFILE"
-                )
-                records.append(Record(
-                    evidence_id, captured_at, "account_service",
-                    values[0], record_type, "PRESENT", "|".join(values),
-                ))
-    except sqlite3.DatabaseError:
-        records = []
-    finally:
-        connection.close()
-    return records or list(sql_records(text, evidence_id, captured_at))
+    return list(sql_records(text, evidence_id, captured_at))
 
 
 def load_records() -> list[Record]:
@@ -833,11 +792,8 @@ def identifiers(cluster: IdentityCluster) -> set[str]:
 
 
 def record_matches(record: Record, ids: set[str]) -> bool:
-    return any(
-        norm(value) in ids
-        or re.sub(r"\D", "", value) in ids
-        for value in record.subject.split("|")
-    )
+    subject_values = {norm(value) for value in record.subject.split("|") if norm(value)}
+    return bool(subject_values.intersection(ids))
 
 
 def operation_for(record: Record) -> tuple[str, str, str] | None:
@@ -884,76 +840,59 @@ def apply_retention_overrides(
     rules: dict[str, str],
     override_log: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply deterministic retention precedence over generated operations."""
+    """Apply absolute, idempotent retention precedence per resource key."""
     record_types: dict[tuple[str, str], set[str]] = defaultdict(set)
     for record in records:
         record_types[(record.system_id, record.resource_id)].add(record.record_type)
-    result: list[dict[str, Any]] = []
-    backup_keys: set[tuple[str, str]] = set()
-    for item in steps:
-        key = (item["system_id"], item["resource_id"])
-        types = record_types.get(key, set())
-        record_type = (
-            "LEGAL_HOLD_RECORD" if "LEGAL_HOLD_RECORD" in types else
-            "SECURITY_AUDIT_LOG" if "SECURITY_AUDIT_LOG" in types else
-            "BACKUP_ARCHIVE" if "BACKUP_ARCHIVE" in types else
-            next(iter(types), "")
-        )
-        operation = item["operation"]
-        replacement: str | None = None
-        if record_type in {"SECURITY_AUDIT_LOG", "LEGAL_HOLD_RECORD"}:
-            if operation in {"DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD"}:
-                replacement = "VERIFY_RECORD_PRESENT"
-            elif operation == "REPORT_REMAINING_RECORD":
-                replacement = None
-        elif record_type in RETAIN_TYPES and record_type != "BACKUP_ARCHIVE":
-            if operation in {"DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD"}:
-                replacement = "VERIFY_RECORD_PRESENT"
-        elif record_type == "BACKUP_ARCHIVE":
-            backup_keys.add(key)
-            if operation == "DELETE_RECORD":
-                continue
-            if operation == "REDACT_RECORD":
-                replacement = "VERIFY_RESTORE_BLOCKED"
-        if replacement:
-            updated = dict(item)
-            updated["phase"] = "VERIFICATION"
-            updated["operation"] = replacement
-            updated["state"] = "PRESENT" if replacement == "VERIFY_RECORD_PRESENT" else "BLOCKED"
-            if override_log is not None:
-                override_log.append({
-                    "system_id": key[0],
-                    "resource_id": key[1],
-                    "record_type": record_type,
-                    "from_operation": operation,
-                    "to_operation": replacement,
-                })
-            result.append(updated)
-        else:
-            result.append(item)
 
-    for key in backup_keys:
-        has_block = any(
-            item["system_id"] == key[0]
-            and item["resource_id"] == key[1]
-            and item["operation"] == "BLOCK_RESTORE"
-            for item in result
-        )
-        if not has_block:
-            result.append(step(
-                "REMEDIATION", key[0], key[1], "BLOCK_RESTORE", "BLOCKED", ""
-            ))
-            result.append(step(
-                "VERIFICATION", key[0], key[1], "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""
-            ))
-            if override_log is not None:
-                override_log.append({
-                    "system_id": key[0],
-                    "resource_id": key[1],
-                    "record_type": "BACKUP_ARCHIVE",
-                    "from_operation": "DELETE_RECORD",
-                    "to_operation": "BLOCK_RESTORE",
-                })
+    retained: dict[tuple[str, str], str] = {}
+    for key, types in record_types.items():
+        if "LEGAL_HOLD_RECORD" in types:
+            retained[key] = "LEGAL_HOLD_RECORD"
+        elif "SECURITY_AUDIT_LOG" in types:
+            retained[key] = "SECURITY_AUDIT_LOG"
+        elif "BACKUP_ARCHIVE" in types:
+            retained[key] = "BACKUP_ARCHIVE"
+        elif types.intersection(RETAIN_TYPES):
+            retained[key] = sorted(types.intersection(RETAIN_TYPES))[0]
+
+    destructive = {
+        "DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD",
+        "VERIFY_RECORD_ABSENT", "VERIFY_RECORD_REDACTED",
+        "VERIFY_RECORD_ANONYMIZED",
+        "REPORT_REMAINING_RECORD", "REPORT_EXPOSED_PII",
+    }
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for item in steps:
+        grouped[(item["system_id"], item["resource_id"])].append(dict(item))
+
+    result: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        record_type = retained.get(key)
+        if not record_type:
+            result.extend(items)
+            continue
+        backup = record_type == "BACKUP_ARCHIVE"
+        filtered = [item for item in items if item["operation"] not in destructive]
+        if any(item["operation"] in destructive for item in items) and override_log is not None:
+            override_log.append({
+                "system_id": key[0],
+                "resource_id": key[1],
+                "record_type": record_type,
+                "from_operation": "DESTRUCTIVE_OPERATION",
+                "to_operation": "VERIFY_RESTORE_BLOCKED" if backup else "VERIFY_RECORD_PRESENT",
+            })
+        if backup and any(
+            item["operation"] in {"REPORT_RESTORE_RISK", "BLOCK_RESTORE"}
+            for item in items
+        ):
+            if not any(item["operation"] == "BLOCK_RESTORE" for item in filtered):
+                filtered.append(step("REMEDIATION", key[0], key[1], "BLOCK_RESTORE", "BLOCKED", ""))
+            if not any(item["operation"] == "VERIFY_RESTORE_BLOCKED" for item in filtered):
+                filtered.append(step("VERIFICATION", key[0], key[1], "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""))
+        elif not any(item["operation"] == "VERIFY_RECORD_PRESENT" for item in filtered):
+            filtered.append(step("VERIFICATION", key[0], key[1], "VERIFY_RECORD_PRESENT", "PRESENT", ""))
+        result.extend(filtered)
     return result
 
 
@@ -1205,6 +1144,7 @@ def llm_audit_suggestions_status(
             ))
         ], False
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, urllib.error.URLError):
+        logger.exception("Fallback Mode: LLM audit suggestions failed for %s", case_id)
         return [], True
 
 
@@ -1351,6 +1291,7 @@ def finalize_rows(
             "suggestions": suggestions,
             "ignored": debug_log,
             "fallback_mode": fallback_mode,
+            "llm_failed": fallback_mode,
         }
         repaired = canonicalize_steps(repaired)
         output_row = dict(row)
