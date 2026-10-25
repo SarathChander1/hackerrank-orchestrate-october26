@@ -45,6 +45,8 @@ FINDING_ORDER = {
     "REPORT_EXPOSED_PII": 2,
     "REPORT_ACTIVE_DATA_FLOW": 3,
     "REPORT_RESTORE_RISK": 4,
+    "REPORT_RESURRECTION_RISK": 5,
+    "REPORT_TOMBSTONE_REQUIRED": 6,
 }
 REMEDIATION_ORDER = {
     "DISABLE_DATA_FLOW": 1,
@@ -52,6 +54,7 @@ REMEDIATION_ORDER = {
     "DELETE_RECORD": 3,
     "REDACT_RECORD": 4,
     "ANONYMIZE_RECORD": 5,
+    "APPLY_TOMBSTONE": 6,
 }
 VERIFICATION_ORDER = {
     "VERIFY_RECORD_ABSENT": 1,
@@ -60,6 +63,7 @@ VERIFICATION_ORDER = {
     "VERIFY_RECORD_ANONYMIZED": 4,
     "VERIFY_DATA_FLOW_DISABLED": 5,
     "VERIFY_RESTORE_BLOCKED": 6,
+    "VERIFY_TOMBSTONE_APPLIED": 7,
 }
 PHASE_ORDER = {"FINDING": 1, "REMEDIATION": 2, "VERIFICATION": 3}
 OPERATION_ORDERS = {
@@ -475,6 +479,8 @@ def load_deletion_rules() -> dict[str, str]:
 def rule_action_for(record: Record, rules: dict[str, str]) -> str:
     """Resolve a record category to its configured action."""
     category = record.record_type.upper()
+    if category == "ACCOUNT_TOMBSTONE":
+        return "TOMBSTONE"
     if category in rules:
         return rules[category]
     if "SEARCH" in category:
@@ -518,14 +524,14 @@ def flow_and_restore_findings(
             )
         ]
         if not flow_events:
-            continue
-        scheduled = any("SCHEDULED" in event.details.upper() for event in flow_events)
-        if len(flow_events) < 2 and not scheduled:
-            continue
-        evidence = flow_events[-1].activity_id
-        findings.append(step(
-            "FINDING", key[0], key[1], "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", evidence
-        ))
+            flow_events = []
+        if flow_events:
+            scheduled = any("SCHEDULED" in event.details.upper() for event in flow_events)
+            if len(flow_events) >= 2 or scheduled:
+                findings.append(step(
+                    "FINDING", key[0], key[1], "REPORT_ACTIVE_DATA_FLOW", "ACTIVE",
+                    flow_events[-1].activity_id,
+                ))
     for key, resource_state in states.items():
         if "BACKUP" not in key[0].upper() and not key[1].lower().startswith("backup_"):
             continue
@@ -545,6 +551,36 @@ def flow_and_restore_findings(
             findings.append(step(
                 "FINDING", key[0], key[1], "REPORT_RESTORE_RISK", "ACTIVE",
                 last_restore.activity_id,
+            ))
+    for key in states:
+        events = [
+            event for event in events_index.get(f"{key[0]}|{key[1]}", [])
+            if event.event_time <= audit_at
+            and event.result in {"SUCCESS", "SUCCEEDED"}
+        ]
+        delete_events = [
+            event for event in events
+            if any(token in event.event_type for token in ("DELETE", "PURGE"))
+        ]
+        if not delete_events:
+            continue
+        last_delete = delete_events[-1]
+        resurrection_events = [
+            event for event in events
+            if event.event_time > last_delete.event_time
+            and any(token in event.event_type for token in (
+                "CREATE", "UPDATE", "SYNC", "WRITE"
+            ))
+        ]
+        if resurrection_events and not any(
+            finding["system_id"] == key[0]
+            and finding["resource_id"] == key[1]
+            and finding["operation"] == "REPORT_RESURRECTION_RISK"
+            for finding in findings
+        ):
+            findings.append(step(
+                "FINDING", key[0], key[1], "REPORT_RESURRECTION_RISK", "ACTIVE",
+                resurrection_events[-1].activity_id,
             ))
     return findings
 
@@ -642,6 +678,7 @@ def validate_reconstructed_states(
         "VERIFY_RECORD_ANONYMIZED": "REDACTED",
         "VERIFY_DATA_FLOW_DISABLED": "ABSENT",
         "VERIFY_RESTORE_BLOCKED": "ABSENT",
+        "VERIFY_TOMBSTONE_APPLIED": "TOMBSTONED",
     }
     for case_id, row in expected.items():
         if row["deletion_status"] == NOT_APPLICABLE_INTENT:
@@ -812,6 +849,10 @@ def operation_for(record: Record) -> tuple[str, str, str] | None:
             "NOT_FOUND", "ABSENT", "DELETED", "ANONYMIZED"
         } else (None, None, "VERIFY_RECORD_ABSENT")
     if kind in REDACT_TYPES:
+        if kind == "ACCOUNT_TOMBSTONE":
+            return ("REPORT_TOMBSTONE_REQUIRED", "APPLY_TOMBSTONE", "VERIFY_TOMBSTONE_APPLIED") if state not in {
+                "TOMBSTONED", "REDACTED", "ABSENT", "NOT_FOUND"
+            } else (None, None, "VERIFY_TOMBSTONE_APPLIED")
         return ("REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED") if state not in {
             "REDACTED", "ABSENT", "NOT_FOUND"
         } else (None, None, "VERIFY_RECORD_REDACTED")
@@ -936,11 +977,18 @@ def audit(
                 else (None, None, "VERIFY_RECORD_ABSENT")
             )
         elif action in {"REDACT", "TOMBSTONE"}:
-            finding, remediation, verification = (
-                ("REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED")
-                if state not in {"REDACTED", "ABSENT", "NOT_FOUND"}
-                else (None, None, "VERIFY_RECORD_REDACTED")
-            )
+            if action == "TOMBSTONE":
+                finding, remediation, verification = (
+                    ("REPORT_TOMBSTONE_REQUIRED", "APPLY_TOMBSTONE", "VERIFY_TOMBSTONE_APPLIED")
+                    if state not in {"TOMBSTONED", "REDACTED", "ABSENT", "NOT_FOUND"}
+                    else (None, None, "VERIFY_TOMBSTONE_APPLIED")
+                )
+            else:
+                finding, remediation, verification = (
+                    ("REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED")
+                    if state not in {"REDACTED", "ABSENT", "NOT_FOUND"}
+                    else (None, None, "VERIFY_RECORD_REDACTED")
+                )
         elif action == "ANONYMIZE":
             finding, remediation, verification = (
                 ("REPORT_EXPOSED_PII", "ANONYMIZE_RECORD", "VERIFY_RECORD_ANONYMIZED")
@@ -959,7 +1007,7 @@ def audit(
                 "REMEDIATION", record.system_id, record.resource_id, remediation,
                 {"DISABLE_DATA_FLOW": "DISABLED", "BLOCK_RESTORE": "BLOCKED",
                  "DELETE_RECORD": "ABSENT", "REDACT_RECORD": "REDACTED",
-                 "ANONYMIZE_RECORD": "ANONYMIZED"}[remediation], "",
+                 "ANONYMIZE_RECORD": "ANONYMIZED", "APPLY_TOMBSTONE": "TOMBSTONED"}[remediation], "",
             ))
         verification_state = {
             "VERIFY_RECORD_ABSENT": "ABSENT",
@@ -968,6 +1016,7 @@ def audit(
             "VERIFY_RECORD_ANONYMIZED": "ANONYMIZED",
             "VERIFY_DATA_FLOW_DISABLED": "DISABLED",
             "VERIFY_RESTORE_BLOCKED": "BLOCKED",
+            "VERIFY_TOMBSTONE_APPLIED": "TOMBSTONED",
         }[verification]
         verifications.append(step("VERIFICATION", record.system_id, record.resource_id, verification, verification_state, record.evidence_id))
 
@@ -982,6 +1031,9 @@ def audit(
             if finding_item["operation"] == "REPORT_ACTIVE_DATA_FLOW":
                 remediation, verification = "DISABLE_DATA_FLOW", "VERIFY_DATA_FLOW_DISABLED"
                 state = "DISABLED"
+            elif finding_item["operation"] == "REPORT_RESURRECTION_RISK":
+                remediation, verification = "DELETE_RECORD", "VERIFY_RECORD_ABSENT"
+                state = "ABSENT"
             else:
                 remediation, verification = "BLOCK_RESTORE", "VERIFY_RESTORE_BLOCKED"
                 state = "BLOCKED"
@@ -1170,6 +1222,7 @@ def apply_allowed_fixes(
         "VERIFY_RECORD_ANONYMIZED": "REDACTED",
         "VERIFY_DATA_FLOW_DISABLED": "DISABLED",
         "VERIFY_RESTORE_BLOCKED": "BLOCKED",
+        "VERIFY_TOMBSTONE_APPLIED": "TOMBSTONED",
     }
     for suggestion in suggestions:
         key = (suggestion.get("system_id"), suggestion.get("resource_id"))
